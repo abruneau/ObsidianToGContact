@@ -280,8 +280,10 @@ describe('Obsidian Namespace', () => {
 
       it('should extract gcontact_id if present', () => {
         mockContent = `
-        # John Doe
+        ---
         gcontact_id: 12345
+        ---
+        # John Doe
         Email:: john.doe@example.com
               `;
         (mockBlob.getDataAsString as jest.Mock).mockReturnValue(mockContent);
@@ -290,8 +292,6 @@ describe('Obsidian Namespace', () => {
         contact.parseMarkdown();
 
         expect(contact.id).toBe('12345');
-        const hasGContactId = (contact as any).hasGContactId;
-        expect(hasGContactId).toBe(true);
       });
 
       it('should handle properties section correctly', () => {
@@ -357,6 +357,7 @@ describe('Obsidian Namespace', () => {
 
         const contact = new Obsidian.Contact(mockFile);
         contact.id = '12345';
+        contact.update();
         const lines = (contact as any).lines;
         expect(doArraysIntersect(lines, ['gcontact_id: 12345'])).toBe(true);
         const lineOffset = (contact as any).lineOffset;
@@ -372,10 +373,12 @@ describe('Obsidian Namespace', () => {
 
         const contact = new Obsidian.Contact(mockFile);
         contact.id = '12345';
+        contact.update();
         const lines = (contact as any).lines;
         expect(doArraysIntersect(lines, ['gcontact_id: 12345'])).toBe(true);
+        expect(doArraysIntersect(lines, ['---'])).toBe(true);
         const lineOffset = (contact as any).lineOffset;
-        expect(lineOffset).toBe(3);
+        expect(lineOffset).toBe(1);
       });
     });
     describe('emails setter', () => {
@@ -389,6 +392,7 @@ describe('Obsidian Namespace', () => {
         contact.emails = newEmails;
 
         expect(contact.emails).toEqual(newEmails);
+        contact.update();
         const lines = (contact as any).lines;
         expect(
           doArraysIntersect(lines, [`Email:: ${newEmails.join(', ')}`])
@@ -402,6 +406,7 @@ describe('Obsidian Namespace', () => {
         contact.emails = undefined;
 
         expect(contact.emails).toBeUndefined();
+        contact.update();
         const lines = (contact as any).lines;
         expect(doArraysIntersect(lines, ['Email::'])).toBe(true);
       });
@@ -413,6 +418,7 @@ describe('Obsidian Namespace', () => {
         contact.emails = [];
 
         expect(contact.emails).toEqual([]);
+        contact.update();
         const lines = (contact as any).lines;
         expect(doArraysIntersect(lines, ['Email::'])).toBe(true);
       });
@@ -425,6 +431,7 @@ describe('Obsidian Namespace', () => {
         contact.manager = newManager;
 
         expect(contact.manager).toBe(newManager);
+        contact.update();
         const lines = (contact as any).lines;
         expect(doArraysIntersect(lines, [`Manager:: ${newManager}`])).toBe(
           true
@@ -438,6 +445,7 @@ describe('Obsidian Namespace', () => {
         contact.manager = undefined;
 
         expect(contact.manager).toBeUndefined();
+        contact.update();
         const lines = (contact as any).lines;
         expect(doArraysIntersect(lines, ['Manager::'])).toBe(true);
       });
@@ -449,8 +457,88 @@ describe('Obsidian Namespace', () => {
         contact.manager = '';
 
         expect(contact.manager).toBe('');
+        contact.update();
         const lines = (contact as any).lines;
         expect(doArraysIntersect(lines, ['Manager::'])).toBe(true);
+      });
+    });
+
+    describe('update function', () => {
+      it('should preserve structure when nothing is updated', () => {
+        mockContent = `
+        ---
+        title: John Doe
+        date_created: 2022-11-10 10:24
+        ---
+        # John Doe
+        Email:: john.doe@example.com
+        Phone:: 123-456-7890
+        `;
+        (mockBlob.getDataAsString as jest.Mock).mockReturnValue(mockContent);
+
+        const contact = new Obsidian.Contact(mockFile);
+        contact.update();
+
+        const lines = (contact as any).lines;
+        // Should preserve the original structure
+        expect(doArraysIntersect(lines, ['title: John Doe'])).toBe(true);
+        expect(
+          doArraysIntersect(lines, ['date_created: 2022-11-10 10:24'])
+        ).toBe(true);
+        expect(doArraysIntersect(lines, ['Email:: john.doe@example.com'])).toBe(
+          true
+        );
+        expect(doArraysIntersect(lines, ['Phone:: 123-456-7890'])).toBe(true);
+      });
+
+      it('should add frontmatter property to existing frontmatter', () => {
+        mockContent = `
+        ---
+        title: John Doe
+        date_created: 2022-11-10 10:24
+        ---
+        # John Doe
+        Email:: john.doe@example.com
+        `;
+        (mockBlob.getDataAsString as jest.Mock).mockReturnValue(mockContent);
+
+        const contact = new Obsidian.Contact(mockFile);
+        contact.id = '12345';
+        contact.update();
+
+        const lines = (contact as any).lines;
+        // Should add gcontact_id to existing frontmatter
+        expect(doArraysIntersect(lines, ['gcontact_id: 12345'])).toBe(true);
+        expect(doArraysIntersect(lines, ['title: John Doe'])).toBe(true);
+        expect(
+          doArraysIntersect(lines, ['date_created: 2022-11-10 10:24'])
+        ).toBe(true);
+        expect(doArraysIntersect(lines, ['Email:: john.doe@example.com'])).toBe(
+          true
+        );
+      });
+
+      it('should create frontmatter section when none exists', () => {
+        mockContent = `
+        # John Doe
+        Email:: john.doe@example.com
+        `;
+        (mockBlob.getDataAsString as jest.Mock).mockReturnValue(mockContent);
+
+        const contact = new Obsidian.Contact(mockFile);
+        contact.id = '12345';
+        contact.update();
+
+        const lines = (contact as any).lines;
+        // Should create new frontmatter section
+        expect(lines[0]).toBe('---');
+        expect(lines[1]).toBe('gcontact_id: 12345');
+        expect(lines[2]).toBe('---');
+        expect(lines[3]).toBe('');
+        expect(lines[4].trim()).toBe('# John Doe');
+        expect(doArraysIntersect(lines, ['Email:: john.doe@example.com'])).toBe(
+          true
+        );
       });
     });
   });

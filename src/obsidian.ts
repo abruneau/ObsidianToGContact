@@ -81,28 +81,13 @@ namespace Obsidian {
    * Handles parsing and updating contact information in markdown format.
    */
   export class Contact {
-    private _id?: string;
     name!: string;
-    private _emails?: string[];
-    private emailsLine!: number;
-    private _phone?: string[];
-    private phoneLine!: number;
-    private _company?: string[];
-    private companyLine!: number;
-    private _role?: string;
-    private roleLine!: number;
-    private _team?: string;
-    private teamLine!: number;
-    private _linkedin?: string;
-    private linkedinLine!: number;
-    private _manager?: string;
-    private managerLine!: number;
     private lineOffset = 0;
+    private properties: Properties = new Properties([]);
 
     private file: GoogleAppsScript.Drive.File;
     private lines: string[];
     private hasProperties = false;
-    private hasGContactId = false;
     private propertiesLineStart = -1;
     private propertiesLineEnd = -1;
 
@@ -163,45 +148,13 @@ namespace Obsidian {
             } else {
               this.propertiesLineEnd = i;
             }
-          } else if (line.includes('gcontact_id')) {
-            this.hasGContactId = true;
-            this._id = line.split(':')[1].trim();
           } else if (line.includes('::')) {
             const attribute = extractContactAttribute(line);
             if (!attribute) continue;
-            const { key, values } = attribute;
-            switch (key.toLowerCase()) {
-              case 'email':
-                this._emails = values;
-                this.emailsLine = i;
-                break;
-              case 'phone':
-                this._phone = values;
-                this.phoneLine = i;
-                break;
-              case 'company':
-                this._company = values;
-                this.companyLine = i;
-                break;
-              case 'role':
-                this._role = values.join(', ');
-                this.roleLine = i;
-                break;
-              case 'team':
-                this._team = values.join(', ');
-                this.teamLine = i;
-                break;
-              case 'linkedin':
-                this._linkedin = values[0];
-                this.linkedinLine = i;
-                break;
-              case 'manager':
-                this._manager = values[0];
-                this.managerLine = i;
-                break;
-            }
+            this.properties.set(attribute.key, attribute.values, i);
           }
         }
+        this.parseFrontMatter();
       } catch (error: unknown) {
         if (error instanceof ContactParsingError) {
           throw error;
@@ -214,11 +167,101 @@ namespace Obsidian {
     }
 
     /**
+     * Parses Obsidian front matter from the markdown file.
+     * Front matter is enclosed between `---` markers and contains YAML-like key-value pairs.
+     *
+     * Supports:
+     * - Simple key-value pairs: `key: value`
+     * - Comma-separated values: `key: [value1, value2]`
+     * - Array values with dashes: `key:\n  - value1\n  - value2`
+     *
+     * @throws {ContactParsingError} If front matter parsing fails
+     */
+    parseFrontMatter(): void {
+      try {
+        if (
+          !this.hasProperties ||
+          this.propertiesLineStart === -1 ||
+          this.propertiesLineEnd === -1
+        ) {
+          return; // No front matter to parse
+        }
+
+        let currentKey: string | null = null;
+        let currentLine = -1;
+        let currentValues: string[] = [];
+
+        for (
+          let i = this.propertiesLineStart + 1;
+          i < this.propertiesLineEnd;
+          i++
+        ) {
+          const line = this.lines[i].trim();
+
+          if (line.length === 0) continue;
+
+          // Check if this is a new key-value pair (not an array item)
+          if (!line.startsWith('-') && line.includes(':')) {
+            // Save previous key-value pair if exists
+            if (currentKey && currentLine !== -1) {
+              this.properties.set(
+                currentKey,
+                currentValues,
+                currentLine,
+                true,
+                false
+              );
+            }
+
+            // Parse new key-value pair
+            const [key, ...valueParts] = line.split(':');
+            currentKey = key.trim();
+            currentLine = i;
+            if (valueParts.length > 0) {
+              // Handle comma-separated values
+              const value = valueParts.join(':').trim();
+              if (value.includes('[')) {
+                currentValues = JSON.parse(value);
+              } else {
+                currentValues = [value];
+              }
+            } else {
+              // Key with no immediate value (might be followed by array items)
+              currentValues = [];
+            }
+          } else if (line.startsWith('-') && currentKey) {
+            // Array item
+            const value = line.substring(1).trim();
+            if (value.length > 0) {
+              currentValues.push(value);
+            }
+          }
+        }
+
+        // Save the last key-value pair
+        if (currentKey && currentValues.length > 0) {
+          this.properties.set(
+            currentKey,
+            currentValues,
+            currentLine,
+            true,
+            false
+          );
+        }
+      } catch (error: unknown) {
+        throw new ContactParsingError(
+          `Failed to parse front matter: ${error instanceof Error ? error.message : String(error)}`,
+          this.file.getName()
+        );
+      }
+    }
+
+    /**
      * Gets the Google Contact ID.
      * @returns The Google Contact ID or undefined if not set
      */
     get id(): string | undefined {
-      return this._id;
+      return this.properties.get('gcontact_id')?.values?.[0];
     }
 
     /**
@@ -232,23 +275,19 @@ namespace Obsidian {
      * @param id - The Google Contact ID to set
      */
     set id(id: string | undefined) {
-      this._id = id;
-      if (this.hasGContactId) {
+      const currentId = this.properties.get('gcontact_id')?.values?.[0];
+      if (currentId) {
         // Log.debug("Google Contact ID already present in the file.");
         return;
       }
-      if (this.hasProperties) {
-        this.lines.splice(
-          this.propertiesLineStart + 1,
-          0,
-          `gcontact_id: ${id}`
-        );
-        this.lineOffset = 1;
-        // Log.debug("Google Contact ID appended to the file.");
-        return;
-      }
-      this.lines = ['---', `gcontact_id: ${id}`, '---', ...this.lines];
-      this.lineOffset = 3;
+      this.properties.set(
+        'gcontact_id',
+        [id ?? ''],
+        this.propertiesLineStart + this.lineOffset + 1,
+        true,
+        false
+      );
+      this.lineOffset += 1;
       //   Log.debug("Google Contact ID appended to the file.");
     }
 
@@ -257,7 +296,7 @@ namespace Obsidian {
      * @returns Array of email addresses or undefined if not set
      */
     get emails(): string[] | undefined {
-      return this._emails;
+      return this.properties.get('email')?.values;
     }
 
     /**
@@ -265,10 +304,19 @@ namespace Obsidian {
      * @param emails - Array of email addresses to set
      */
     set emails(emails: string[] | undefined) {
-      this.lines[this.emailsLine + this.lineOffset] = emails
-        ? `Email:: ${emails.join(', ')}`
-        : 'Email::';
-      this._emails = emails;
+      const currentEmails = this.properties.get('email');
+      if (currentEmails) {
+        currentEmails.values = emails;
+        return;
+      }
+      this.properties.set(
+        'email',
+        emails,
+        this.propertiesLineStart + this.lineOffset + 1,
+        true,
+        false
+      );
+      this.lineOffset += 1;
     }
 
     /**
@@ -276,7 +324,7 @@ namespace Obsidian {
      * @returns Array of phone numbers or undefined if not set
      */
     get phone(): string[] | undefined {
-      return this._phone;
+      return this.properties.get('phone')?.values;
     }
 
     /**
@@ -284,10 +332,19 @@ namespace Obsidian {
      * @param phone - Array of phone numbers to set
      */
     set phone(phone: string[] | undefined) {
-      this.lines[this.phoneLine + this.lineOffset] = phone
-        ? `Phone:: ${phone.join(', ')}`
-        : 'Phone::';
-      this._phone = phone;
+      const currentPhone = this.properties.get('phone');
+      if (currentPhone) {
+        currentPhone.values = phone;
+        return;
+      }
+      this.properties.set(
+        'phone',
+        phone,
+        this.propertiesLineStart + this.lineOffset + 1,
+        true,
+        false
+      );
+      this.lineOffset += 1;
     }
 
     /**
@@ -295,7 +352,7 @@ namespace Obsidian {
      * @returns Array of company names or undefined if not set
      */
     get company(): string[] | undefined {
-      return this._company;
+      return this.properties.get('company')?.values;
     }
 
     /**
@@ -304,10 +361,19 @@ namespace Obsidian {
      * @param company - Array of company names to set
      */
     set company(company: string[] | undefined) {
-      this.lines[this.companyLine + this.lineOffset] = company
-        ? `Company:: ${company.map(c => `[[${c}]]`).join(', ')}`
-        : 'Company::';
-      this._company = company;
+      const currentCompany = this.properties.get('company');
+      if (currentCompany) {
+        currentCompany.values = company;
+        return;
+      }
+      this.properties.set(
+        'company',
+        company?.map(c => `[[${c}]]`),
+        this.propertiesLineStart + this.lineOffset + 1,
+        true,
+        false
+      );
+      this.lineOffset += 1;
     }
 
     /**
@@ -315,7 +381,7 @@ namespace Obsidian {
      * @returns The role or undefined if not set
      */
     get role(): string | undefined {
-      return this._role;
+      return this.properties.get('role')?.values?.[0];
     }
 
     /**
@@ -323,10 +389,19 @@ namespace Obsidian {
      * @param role - The role to set
      */
     set role(role: string | undefined) {
-      this.lines[this.roleLine + this.lineOffset] = role
-        ? `Role:: ${role}`
-        : 'Role::';
-      this._role = role;
+      const currentRole = this.properties.get('role');
+      if (currentRole) {
+        currentRole.values = role === undefined ? undefined : [role];
+        return;
+      }
+      this.properties.set(
+        'role',
+        role === undefined ? undefined : [role],
+        this.propertiesLineStart + this.lineOffset + 1,
+        true,
+        false
+      );
+      this.lineOffset += 1;
     }
 
     /**
@@ -334,7 +409,7 @@ namespace Obsidian {
      * @returns The team or undefined if not set
      */
     get team(): string | undefined {
-      return this._team;
+      return this.properties.get('team')?.values?.[0];
     }
 
     /**
@@ -342,10 +417,19 @@ namespace Obsidian {
      * @param team - The team to set
      */
     set team(team: string | undefined) {
-      this.lines[this.teamLine + this.lineOffset] = team
-        ? `Team:: ${team}`
-        : 'Team::';
-      this._team = team;
+      const currentTeam = this.properties.get('team');
+      if (currentTeam) {
+        currentTeam.values = team === undefined ? undefined : [team];
+        return;
+      }
+      this.properties.set(
+        'team',
+        team === undefined ? undefined : [team],
+        this.propertiesLineStart + this.lineOffset + 1,
+        true,
+        false
+      );
+      this.lineOffset += 1;
     }
 
     /**
@@ -353,7 +437,7 @@ namespace Obsidian {
      * @returns The LinkedIn URL or undefined if not set
      */
     get linkedin(): string | undefined {
-      return this._linkedin;
+      return this.properties.get('linkedin')?.values?.[0];
     }
 
     /**
@@ -361,10 +445,20 @@ namespace Obsidian {
      * @param linkedin - The LinkedIn URL to set
      */
     set linkedin(linkedin: string | undefined) {
-      this.lines[this.linkedinLine + this.lineOffset] = linkedin
-        ? `Linkedin:: ${linkedin}`
-        : 'Linkedin::';
-      this._linkedin = linkedin;
+      const currentLinkedin = this.properties.get('linkedin');
+      if (currentLinkedin) {
+        currentLinkedin.values =
+          linkedin === undefined ? undefined : [linkedin];
+        return;
+      }
+      this.properties.set(
+        'linkedin',
+        linkedin === undefined ? undefined : [linkedin],
+        this.propertiesLineStart + this.lineOffset + 1,
+        true,
+        false
+      );
+      this.lineOffset += 1;
     }
 
     /**
@@ -372,7 +466,7 @@ namespace Obsidian {
      * @returns The manager or undefined if not set
      */
     get manager(): string | undefined {
-      return this._manager;
+      return this.properties.get('manager')?.values?.[0];
     }
 
     /**
@@ -380,10 +474,49 @@ namespace Obsidian {
      * @param manager - The manager to set
      */
     set manager(manager: string | undefined) {
-      this.lines[this.managerLine + this.lineOffset] = manager
-        ? `Manager:: ${manager}`
-        : 'Manager::';
-      this._manager = manager;
+      const currentManager = this.properties.get('manager');
+      if (currentManager) {
+        currentManager.values = manager === undefined ? undefined : [manager];
+        return;
+      }
+      this.properties.set(
+        'manager',
+        manager === undefined ? undefined : [manager],
+        this.propertiesLineStart + this.lineOffset + 1,
+        true,
+        false
+      );
+      this.lineOffset += 1;
+    }
+
+    update(): void {
+      const frontMatter = this.properties.buildFrontMatter();
+      const oldFrontMatterLenght =
+        this.propertiesLineEnd - this.propertiesLineStart;
+      const newFrontMatterLenght = frontMatter.length + 2;
+      const offset = newFrontMatterLenght - oldFrontMatterLenght;
+
+      if (this.hasProperties) {
+        this.lines.splice(
+          this.propertiesLineStart,
+          oldFrontMatterLenght - 2,
+          ...frontMatter
+        );
+      } else {
+        this.lines.unshift('---');
+        this.lines.unshift(...frontMatter);
+        this.lines.unshift('---');
+      }
+
+      Array.from(this.properties.properties.values()).forEach(
+        (property: Property) => {
+          if (!property.isFrontmatter) {
+            this.lines[property.line + offset] = property.values?.length
+              ? `${property.key}:: ${property.values.join(', ')}`
+              : `${property.key}::`;
+          }
+        }
+      );
     }
 
     /**
@@ -400,6 +533,73 @@ namespace Obsidian {
           'write'
         );
       }
+    }
+  }
+
+  export class Property {
+    isFrontmatter: boolean;
+    key: string;
+    values: string[] | undefined;
+    line: number;
+    deleted = false;
+
+    constructor(
+      key: string,
+      values: string[] | undefined,
+      line: number,
+      isFrontmatter = false,
+      deleted = false
+    ) {
+      this.key = key;
+      this.values = values;
+      this.line = line;
+      this.isFrontmatter = isFrontmatter;
+      this.deleted = deleted;
+    }
+  }
+
+  export class Properties {
+    properties: Map<string, Property> = new Map();
+
+    constructor(properties: Property[]) {
+      properties.forEach(property => {
+        this.properties.set(property.key.toLowerCase(), property);
+      });
+    }
+
+    get(key: string): Property | undefined {
+      return this.properties.get(key.toLowerCase());
+    }
+
+    set(
+      key: string,
+      values: string[] | undefined,
+      line: number,
+      isFrontmatter = false,
+      deleted = false
+    ): void {
+      this.properties.set(
+        key.toLowerCase(),
+        new Property(key, values, line, isFrontmatter, deleted)
+      );
+    }
+
+    delete(key: string): void {
+      const property = this.properties.get(key.toLowerCase());
+      if (property) {
+        property.deleted = true;
+      }
+    }
+
+    buildFrontMatter(): string[] {
+      return Array.from(this.properties.values())
+        .filter((p: Property) => p.isFrontmatter)
+        .map((p: Property) => {
+          if (p.values?.length === 1) {
+            return `${p.key}: ${p.values[0]}`;
+          }
+          return `${p.key}:\n  - ${p.values?.join('\n  - ')}`;
+        });
     }
   }
 }
