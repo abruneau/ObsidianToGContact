@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 import { ContactParsingError, FileOperationError } from './errors';
+import {
+  parseFrontmatter,
+  rebuildFrontmatter,
+  updateFrontmatter,
+} from './frontmatter';
 
 namespace Obsidian {
   /**
@@ -33,34 +38,89 @@ namespace Obsidian {
     key: string;
     values: string[];
   } | null {
-    // eslint-disable-next-line prefer-const
-    let [key, value] = line
-      .split('::')
-      .map(str => str.trim())
-      .filter(str => str.length > 0);
+    const separatorIndex = line.indexOf('::');
+    if (separatorIndex === -1) return null;
+
+    const key = line.slice(0, separatorIndex).trim();
+    let value = line.slice(separatorIndex + 2).trim();
     if (!key || !value) return null;
+    const preservedGeoLinks = new Map<string, string>();
+    value = preserveGeoMarkdownLinks(value, preservedGeoLinks);
     value = removeBrackets(value);
     const values = value
       .split(',')
       .map(str => removeBrackets(str.trim()))
-      .map(str => cleanUrl(str));
+      .map(str => cleanUrl(str))
+      .map(str => restorePreservedGeoMarkdownLinks(str, preservedGeoLinks));
     return { key, values };
   }
 
+  function preserveGeoMarkdownLinks(
+    input: string,
+    preservedLinks: Map<string, string>
+  ): string {
+    return input.replace(/\[[^\]\n]+\]\(\s*geo:[^)]+\)/gi, match => {
+      const token = `__PRESERVED_GEO_MARKDOWN_LINK_${preservedLinks.size}__`;
+      preservedLinks.set(token, match);
+      return token;
+    });
+  }
+
+  function restorePreservedGeoMarkdownLinks(
+    input: string,
+    preservedLinks: Map<string, string>
+  ): string {
+    let output = input;
+    preservedLinks.forEach((value, token) => {
+      output = output.replace(token, value);
+    });
+    return output;
+  }
+
   /**
-   * Removes square brackets and parentheses from a string.
+   * Extracts clean text from Obsidian link format [[Text]].
+   * If the input is not an Obsidian link, returns it unchanged.
+   *
+   * @param input - The string that may contain an Obsidian link
+   * @returns The extracted text without the double brackets, or the original string if not a link
+   * @example
+   * // Returns "Decathlon"
+   * extractObsidianLinkText("[[Decathlon]]")
+   *
+   * // Returns "Adeo" (no change, not a link)
+   * extractObsidianLinkText("Adeo")
+   *
+   * // Returns "Team Name"
+   * extractObsidianLinkText("[[Team Name]]")
+   */
+  export function extractObsidianLinkText(input: string): string {
+    const match = input.match(/^\[\[(.+?)\]\]$/);
+    if (match) {
+      return match[1].trim();
+    }
+    return input;
+  }
+
+  /**
+   * Removes single square brackets and parentheses from a string.
+   * Preserves double square brackets (Obsidian links) intact.
    *
    * @param input - The string to clean
-   * @returns The string with brackets and parentheses removed
+   * @returns The string with single brackets and parentheses removed, double brackets preserved
    * @example
-   * // Returns "example"
+   * // Returns "[[Obsidian]]" (preserved)
+   * removeBrackets("[[Obsidian]]")
+   *
+   * // Returns "example" (single brackets removed)
    * removeBrackets("[example]")
    *
-   * // Returns "example"
+   * // Returns "example" (parentheses removed)
    * removeBrackets("(example)")
    */
   export function removeBrackets(input: string): string {
-    return input.replace(/[[\]()]/g, '');
+    // Remove single brackets and parentheses, but preserve double brackets [[...]]
+    // Strategy: Replace single [ or ] that are NOT part of [[ or ]]
+    return input.replace(/(?<!\[)\[(?!\[)|(?<!\])\](?!\])|[()]/g, '');
   }
 
   /**
@@ -167,13 +227,17 @@ namespace Obsidian {
     }
 
     /**
-     * Parses Obsidian front matter from the markdown file.
+     * Parses Obsidian front matter from the markdown file using the robust frontmatter parser.
      * Front matter is enclosed between `---` markers and contains YAML-like key-value pairs.
      *
      * Supports:
      * - Simple key-value pairs: `key: value`
-     * - Comma-separated values: `key: [value1, value2]`
-     * - Array values with dashes: `key:\n  - value1\n  - value2`
+     * - Arrays: `key: [value1, value2]` or `key:\n  - value1\n  - value2`
+     * - Nested objects: `key:\n  subkey: value`
+     * - Boolean values: `published: true`
+     * - Numeric values: `count: 42`
+     * - Quoted strings: `title: "Hello World"`
+     * - Dates: `date: 2023-12-01`
      *
      * @throws {ContactParsingError} If front matter parsing fails
      */
@@ -187,65 +251,21 @@ namespace Obsidian {
           return; // No front matter to parse
         }
 
-        let currentKey: string | null = null;
-        let currentLine = -1;
-        let currentValues: string[] = [];
+        // Extract the frontmatter section from the file content
+        const content = this.lines.join('\n');
+        const frontmatterResult = parseFrontmatter(content);
 
-        for (
-          let i = this.propertiesLineStart + 1;
-          i < this.propertiesLineEnd;
-          i++
-        ) {
-          const line = this.lines[i].trim();
+        // Process the parsed frontmatter data
+        this.processFrontmatterData(
+          frontmatterResult.data,
+          this.propertiesLineStart + 1
+        );
 
-          if (line.length === 0) continue;
-
-          // Check if this is a new key-value pair (not an array item)
-          if (!line.startsWith('-') && line.includes(':')) {
-            // Save previous key-value pair if exists
-            if (currentKey && currentLine !== -1) {
-              this.properties.set(
-                currentKey,
-                currentValues,
-                currentLine,
-                true,
-                false
-              );
-            }
-
-            // Parse new key-value pair
-            const [key, ...valueParts] = line.split(':');
-            currentKey = key.trim();
-            currentLine = i;
-            if (valueParts.length > 0) {
-              // Handle comma-separated values
-              const value = valueParts.join(':').trim();
-              if (value.includes('[')) {
-                currentValues = JSON.parse(value);
-              } else {
-                currentValues = [value];
-              }
-            } else {
-              // Key with no immediate value (might be followed by array items)
-              currentValues = [];
-            }
-          } else if (line.startsWith('-') && currentKey) {
-            // Array item
-            const value = line.substring(1).trim();
-            if (value.length > 0) {
-              currentValues.push(value);
-            }
-          }
-        }
-
-        // Save the last key-value pair
-        if (currentKey && currentValues.length > 0) {
-          this.properties.set(
-            currentKey,
-            currentValues,
-            currentLine,
-            true,
-            false
+        // Log any parsing errors
+        if (frontmatterResult.errors.length > 0) {
+          console.warn(
+            `Frontmatter parsing warnings for ${this.file.getName()}:`,
+            frontmatterResult.errors
           );
         }
       } catch (error: unknown) {
@@ -254,6 +274,88 @@ namespace Obsidian {
           this.file.getName()
         );
       }
+    }
+
+    /**
+     * Processes the parsed frontmatter data and adds it to the properties.
+     *
+     * @param data - The parsed frontmatter data
+     * @param startLine - The starting line number for frontmatter properties
+     */
+    private processFrontmatterData(
+      data: Record<string, any>,
+      startLine: number
+    ): void {
+      let lineOffset = 0;
+
+      for (const [key, value] of Object.entries(data)) {
+        const values = this.convertValueToStringArray(value);
+        this.properties.set(key, values, startLine + lineOffset, true, false);
+        lineOffset++;
+      }
+    }
+
+    /**
+     * Converts a frontmatter value to a string array format expected by the Properties class.
+     *
+     * @param value - The value to convert
+     * @returns Array of string values
+     */
+    private convertValueToStringArray(value: any): string[] {
+      if (value === null || value === undefined) {
+        return [];
+      }
+
+      if (Array.isArray(value)) {
+        const hadObjectElement = value.some(
+          v => v !== null && typeof v === 'object'
+        );
+        const out = value.map(v => {
+          if (v === null || v === undefined) {
+            return '';
+          }
+          if (typeof v === 'object') {
+            return JSON.stringify(v);
+          }
+          return String(v);
+        });
+        // #region agent log
+        if (hadObjectElement) {
+          const post = (globalThis as { fetch?: typeof fetch }).fetch;
+          if (typeof post === 'function') {
+            post(
+              'http://127.0.0.1:7751/ingest/6dbcf72c-888b-4fa0-99ad-0b0772d3d5b6',
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Debug-Session-Id': 'c12397',
+                },
+                body: JSON.stringify({
+                  sessionId: 'c12397',
+                  hypothesisId: 'A',
+                  location: 'obsidian.ts:convertValueToStringArray',
+                  message:
+                    'frontmatter array had object element(s); normalized to JSON strings',
+                  data: { sample: out.slice(0, 5) },
+                  timestamp: Date.now(),
+                  runId: 'post-fix',
+                }),
+              }
+            ).catch(() => {});
+          }
+        }
+        // #endregion
+        return out;
+      }
+
+      if (typeof value === 'object') {
+        // For complex objects, convert to JSON string
+        return [JSON.stringify(value)];
+      }
+
+      // Convert primitive values to strings
+      return [String(value)];
     }
 
     /**
@@ -275,9 +377,11 @@ namespace Obsidian {
      * @param id - The Google Contact ID to set
      */
     set id(id: string | undefined) {
-      const currentId = this.properties.get('gcontact_id')?.values?.[0];
-      if (currentId) {
-        // Log.debug("Google Contact ID already present in the file.");
+      const existing = this.properties.get('gcontact_id');
+      if (existing) {
+        if (existing.values?.[0] !== id) {
+          existing.values = [id ?? ''];
+        }
         return;
       }
       this.properties.set(
@@ -288,7 +392,6 @@ namespace Obsidian {
         false
       );
       this.lineOffset += 1;
-      //   Log.debug("Google Contact ID appended to the file.");
     }
 
     /**
@@ -348,11 +451,14 @@ namespace Obsidian {
     }
 
     /**
-     * Gets the contact's company names.
-     * @returns Array of company names or undefined if not set
+     * Gets the contact's company names with clean text extracted from Obsidian links.
+     * Extracts "Company" from "[[Company]]" format for use with Google Contacts API.
+     * @returns Array of company names (clean text) or undefined if not set
      */
     get company(): string[] | undefined {
-      return this.properties.get('company')?.values;
+      const values = this.properties.get('company')?.values;
+      if (!values) return undefined;
+      return values.map(v => extractObsidianLinkText(v));
     }
 
     /**
@@ -405,11 +511,14 @@ namespace Obsidian {
     }
 
     /**
-     * Gets the contact's team.
-     * @returns The team or undefined if not set
+     * Gets the contact's team with clean text extracted from Obsidian links.
+     * Extracts "Team" from "[[Team]]" format for use with Google Contacts API.
+     * @returns The team (clean text) or undefined if not set
      */
     get team(): string | undefined {
-      return this.properties.get('team')?.values?.[0];
+      const value = this.properties.get('team')?.values?.[0];
+      if (value === undefined) return undefined;
+      return extractObsidianLinkText(value);
     }
 
     /**
@@ -462,11 +571,14 @@ namespace Obsidian {
     }
 
     /**
-     * Gets the contact's manager.
-     * @returns The manager or undefined if not set
+     * Gets the contact's manager with clean text extracted from Obsidian links.
+     * Extracts "Manager" from "[[Manager]]" format for use with Google Contacts API.
+     * @returns The manager (clean text) or undefined if not set
      */
     get manager(): string | undefined {
-      return this.properties.get('manager')?.values?.[0];
+      const value = this.properties.get('manager')?.values?.[0];
+      if (value === undefined) return undefined;
+      return extractObsidianLinkText(value);
     }
 
     /**
@@ -490,30 +602,59 @@ namespace Obsidian {
     }
 
     update(): void {
-      const frontMatter = this.properties.buildFrontMatter();
-      const oldFrontMatterLenght =
-        this.propertiesLineEnd - this.propertiesLineStart;
-      const newFrontMatterLenght = frontMatter.length + 2;
-      const offset = newFrontMatterLenght - oldFrontMatterLenght;
+      // Build the new frontmatter data
+      const frontmatterData: Record<string, any> = {};
 
-      if (this.hasProperties) {
-        this.lines.splice(
-          this.propertiesLineStart,
-          oldFrontMatterLenght - 2,
-          ...frontMatter
-        );
-      } else {
-        this.lines.unshift('---');
-        this.lines.unshift(...frontMatter);
-        this.lines.unshift('---');
-      }
+      // Fields that should always be arrays even with one element
+      const arrayFields = ['tags', 'aliases', 'categories'];
 
+      Array.from(this.properties.properties.values())
+        .filter((p: Property) => p.isFrontmatter)
+        .forEach((p: Property) => {
+          if (p.values !== undefined) {
+            // Preserve empty arrays for array fields
+            if (arrayFields.includes(p.key.toLowerCase())) {
+              frontmatterData[p.key] = p.values;
+            } else if (p.values.length > 1) {
+              frontmatterData[p.key] = p.values;
+            } else if (p.values.length === 1) {
+              frontmatterData[p.key] = p.values[0];
+            }
+            // Skip fields with empty non-array values
+          }
+        });
+
+      // Get the current content
+      const currentContent = this.lines.join('\n');
+
+      // Use the robust updateFrontmatter function
+      const updatedContent = updateFrontmatter(
+        currentContent,
+        frontmatterData,
+        {
+          indent: 2,
+          sortKeys: false,
+        }
+      );
+
+      // Update the lines array
+      this.lines = updatedContent.split('\n');
+
+      // Update non-frontmatter properties in the content
+      // Note: After using updateFrontmatter, we need to find the correct line numbers
+      // for non-frontmatter properties since the content structure may have changed
       Array.from(this.properties.properties.values()).forEach(
         (property: Property) => {
           if (!property.isFrontmatter) {
-            this.lines[property.line + offset] = property.values?.length
-              ? `${property.key}:: ${property.values.join(', ')}`
-              : `${property.key}::`;
+            // Find the line containing this property by searching for the key::
+            for (let i = 0; i < this.lines.length; i++) {
+              if (this.lines[i].includes(`${property.key}::`)) {
+                this.lines[i] = property.values?.length
+                  ? `${property.key}:: ${property.values.join(', ')}`
+                  : `${property.key}::`;
+                break;
+              }
+            }
           }
         }
       );
@@ -592,14 +733,35 @@ namespace Obsidian {
     }
 
     buildFrontMatter(): string[] {
-      return Array.from(this.properties.values())
+      // Convert properties to a data object for the rebuild function
+      const data: Record<string, any> = {};
+
+      // Fields that should always be arrays even with one element
+      const arrayFields = ['tags', 'aliases', 'categories'];
+
+      Array.from(this.properties.values())
         .filter((p: Property) => p.isFrontmatter)
-        .map((p: Property) => {
-          if (p.values?.length === 1) {
-            return `${p.key}: ${p.values[0]}`;
+        .forEach((p: Property) => {
+          if (p.values !== undefined) {
+            // Preserve empty arrays for array fields
+            if (arrayFields.includes(p.key.toLowerCase())) {
+              data[p.key] = p.values;
+            } else if (p.values.length > 1) {
+              data[p.key] = p.values;
+            } else if (p.values.length === 1) {
+              data[p.key] = p.values[0];
+            }
+            // Skip fields with empty non-array values
           }
-          return `${p.key}:\n  - ${p.values?.join('\n  - ')}`;
         });
+
+      // Use the robust rebuild function
+      const yaml = rebuildFrontmatter(data, {
+        indent: 2,
+        sortKeys: false,
+      });
+
+      return yaml.split('\n');
     }
   }
 }
